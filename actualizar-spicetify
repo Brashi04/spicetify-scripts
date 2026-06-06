@@ -1,0 +1,276 @@
+#!/bin/bash
+# ================================================================
+# actualizar-spicetify — Actualiza Spicetify de forma segura
+# Hace backup automático y restaura si algo sale mal
+# ================================================================
+
+set -euo pipefail
+
+# ────────────────────────────────────────────────────────────────
+# COLORES — para que los mensajes sean fáciles de leer
+# ────────────────────────────────────────────────────────────────
+VERDE='\033[0;32m'
+ROJO='\033[0;31m'
+AMARILLO='\033[1;33m'
+AZUL='\033[0;34m'
+NEGRITA='\033[1m'
+NC='\033[0m' # Sin color
+
+# ────────────────────────────────────────────────────────────────
+# VARIABLES globales
+# ────────────────────────────────────────────────────────────────
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+SPICETIFY_CONFIG="$HOME/.config/spicetify"
+BACKUP_DIR="$SPICETIFY_CONFIG/backups/$TIMESTAMP"
+MARKETPLACE_DIR="$SPICETIFY_CONFIG/CustomApps/marketplace"
+PACMAN_LOG="/var/log/pacman.log"
+
+# Estas variables se van llenando durante la ejecución
+VERSION_ANTES=""
+VERSION_DESPUES=""
+ACTUALIZACIONES=()
+BACKUP_CREADO=false
+BACKUP_USADO=false
+MOTIVO_FALLO=""
+
+# ────────────────────────────────────────────────────────────────
+# FUNCIONES para imprimir mensajes con formato
+# ────────────────────────────────────────────────────────────────
+ok()    { echo -e "${VERDE}✓${NC} [$(date +%H:%M:%S)] $*"; }
+error() { echo -e "${ROJO}✗${NC} [$(date +%H:%M:%S)] $*" >&2; }
+info()  { echo -e "${AMARILLO}→${NC} [$(date +%H:%M:%S)] $*"; }
+titulo(){ echo -e "\n${AZUL}${NEGRITA}▶ $*${NC}"; echo -e "${AZUL}$(printf '─%.0s' {1..45})${NC}"; }
+
+# ────────────────────────────────────────────────────────────────
+# FUNCIÓN: restaurar el backup si algo falla
+# ────────────────────────────────────────────────────────────────
+restaurar_backup() {
+    # Desactivamos la trampa primero para evitar bucles infinitos
+    trap - ERR
+    MOTIVO_FALLO="${1:-Error inesperado}"
+
+    error "Algo salió mal: $MOTIVO_FALLO"
+
+    if [[ "$BACKUP_CREADO" == true && -d "$BACKUP_DIR" ]]; then
+        info "Restaurando tu configuración anterior..."
+
+        # Borrar configuración actual (sin tocar la carpeta de backups)
+        find "$SPICETIFY_CONFIG" -mindepth 1 -maxdepth 1 \
+            ! -name "backups" -exec rm -rf {} + 2>/dev/null || true
+
+        # Restaurar desde el backup
+        cp -r "$BACKUP_DIR/." "$SPICETIFY_CONFIG/" 2>/dev/null || true
+
+        BACKUP_USADO=true
+        ok "Configuración anterior restaurada correctamente"
+    else
+        error "No hay backup disponible para restaurar"
+    fi
+
+    mostrar_resumen
+    exit 1
+}
+
+# Activamos la trampa: si cualquier comando falla, se llama restaurar_backup
+trap 'restaurar_backup "Error en línea $LINENO"' ERR
+
+# ────────────────────────────────────────────────────────────────
+# FUNCIÓN: mostrar el resumen al final
+# ────────────────────────────────────────────────────────────────
+mostrar_resumen() {
+    echo ""
+    echo -e "${NEGRITA}┌─────────────────────────────────────────┐${NC}"
+    echo -e "${NEGRITA}│           RESUMEN DE LA ACTUALIZACIÓN    │${NC}"
+    echo -e "${NEGRITA}└─────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  Versión antes:   ${AMARILLO}${VERSION_ANTES:-desconocida}${NC}"
+    echo -e "  Versión después: ${VERDE}${VERSION_DESPUES:-desconocida}${NC}"
+    echo ""
+
+    if [[ ${#ACTUALIZACIONES[@]} -gt 0 ]]; then
+        echo -e "  Cambios realizados:"
+        for item in "${ACTUALIZACIONES[@]}"; do
+            echo -e "    ${VERDE}✓${NC} $item"
+        done
+    else
+        echo -e "  ${AMARILLO}Todo ya estaba actualizado — no hubo cambios${NC}"
+    fi
+    echo ""
+
+    if [[ "$BACKUP_USADO" == true ]]; then
+        echo -e "  ${ROJO}⚠  Se restauró el backup por un fallo${NC}"
+        echo -e "  ${ROJO}   Motivo: $MOTIVO_FALLO${NC}"
+    elif [[ "$BACKUP_CREADO" == true ]]; then
+        echo -e "  ${VERDE}✓  Backup guardado en:${NC}"
+        echo -e "     $BACKUP_DIR"
+    fi
+    echo ""
+}
+
+# ================================================================
+# PASO 1: Verificar que todo lo necesario está instalado
+# ================================================================
+titulo "PASO 1 — Verificando herramientas necesarias"
+
+FALTA=()
+
+# Revisamos cada herramienta que el script necesita
+for cmd in spicetify yay curl; do
+    if command -v "$cmd" &>/dev/null; then
+        ok "$cmd — encontrado"
+    else
+        error "$cmd — NO encontrado"
+        FALTA+=("$cmd")
+    fi
+done
+
+# Spotify puede estar en distintos lugares según cómo se instaló
+if command -v spotify &>/dev/null || [[ -f /opt/spotify/spotify ]]; then
+    ok "spotify — encontrado"
+else
+    error "spotify — NO encontrado"
+    FALTA+=("spotify")
+fi
+
+# Si falta algo, paramos aquí antes de hacer cualquier cambio
+if [[ ${#FALTA[@]} -gt 0 ]]; then
+    trap - ERR
+    error "Faltan herramientas: ${FALTA[*]}"
+    error "Instálalas con: yay -S ${FALTA[*]}"
+    exit 1
+fi
+
+# Guardamos la versión actual ANTES de actualizar (para el resumen final)
+VERSION_ANTES=$(spicetify --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "desconocida")
+ok "Versión actual de Spicetify: $VERSION_ANTES"
+
+# ================================================================
+# PASO 2: Hacer backup de la configuración actual
+# ================================================================
+titulo "PASO 2 — Creando backup de seguridad"
+
+mkdir -p "$BACKUP_DIR"
+
+# Copiamos toda la config de Spicetify, excepto la carpeta de backups anteriores
+if [[ -d "$SPICETIFY_CONFIG" ]]; then
+    # rsync es más eficiente, pero si no está disponible usamos cp
+    if command -v rsync &>/dev/null; then
+        rsync -a --exclude="backups/" "$SPICETIFY_CONFIG/" "$BACKUP_DIR/"
+    else
+        cp -r "$SPICETIFY_CONFIG/." "$BACKUP_DIR/"
+        # Borrar cualquier carpeta de backups que se haya copiado dentro
+        rm -rf "$BACKUP_DIR/backups" 2>/dev/null || true
+    fi
+    BACKUP_CREADO=true
+    ok "Backup creado en: $BACKUP_DIR"
+else
+    info "No hay configuración previa — el backup estará vacío"
+    BACKUP_CREADO=true
+fi
+
+# ================================================================
+# PASO 3: Actualizar Spicetify CLI
+# ================================================================
+titulo "PASO 3 — Actualizando Spicetify CLI"
+
+info "Ejecutando actualización con yay..."
+
+# Guardamos la versión antes para poder comparar después
+VER_ANTES_CLI=$(spicetify --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "0")
+
+# --noconfirm = responde "sí" a todo automáticamente
+if ! yay -S spicetify-cli --noconfirm 2>&1; then
+    restaurar_backup "No se pudo actualizar spicetify-cli con yay (¿necesitas ingresar tu contraseña sudo?)"
+fi
+
+VER_DESPUES_CLI=$(spicetify --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "0")
+VERSION_DESPUES="$VER_DESPUES_CLI"
+
+if [[ "$VER_ANTES_CLI" != "$VER_DESPUES_CLI" ]]; then
+    ok "Spicetify CLI actualizado: $VER_ANTES_CLI → $VER_DESPUES_CLI"
+    ACTUALIZACIONES+=("spicetify-cli $VER_ANTES_CLI → $VER_DESPUES_CLI")
+else
+    ok "Spicetify CLI ya estaba en la versión más reciente ($VER_DESPUES_CLI)"
+fi
+
+# ================================================================
+# PASO 4: Actualizar Marketplace (si está instalado)
+# ================================================================
+titulo "PASO 4 — Marketplace de Spicetify"
+
+if [[ -d "$MARKETPLACE_DIR" ]]; then
+    info "Marketplace detectado — actualizando via script oficial..."
+
+    # El script oficial de Spicetify Marketplace descarga la última versión
+    # y la instala en la carpeta CustomApps/marketplace
+    if ! curl -fsSL https://raw.githubusercontent.com/spicetify/marketplace/main/resources/install.sh \
+        | sh 2>&1; then
+        restaurar_backup "No se pudo actualizar el Marketplace de Spicetify"
+    fi
+
+    ok "Marketplace actualizado"
+    ACTUALIZACIONES+=("spicetify-marketplace")
+else
+    info "Marketplace no está instalado — omitiendo este paso"
+fi
+
+# ================================================================
+# PASO 5: Detectar si Spotify fue actualizado recientemente
+# ================================================================
+titulo "PASO 5 — Revisando si Spotify fue actualizado"
+
+SPOTIFY_ACTUALIZADO=false
+
+# Miramos el log de pacman buscando si Spotify fue actualizado
+# en las últimas 24 horas (una actualización de Spotify rompe Spicetify)
+if [[ -f "$PACMAN_LOG" ]]; then
+    HACE_24H=$(date -d "24 hours ago" +"%Y-%m-%dT%H:%M" 2>/dev/null || echo "")
+
+    if [[ -n "$HACE_24H" ]]; then
+        # Buscamos líneas con "spotify" que sean más recientes que hace 24h
+        if grep -E "upgraded|installed" "$PACMAN_LOG" 2>/dev/null \
+           | awk -F'[\\[\\]]' '{print $2, $0}' \
+           | awk -v desde="$HACE_24H" '$1 >= desde' \
+           | grep -qi "spotify"; then
+            SPOTIFY_ACTUALIZADO=true
+            info "Spotify fue actualizado en las últimas 24h — se re-aplicará Spicetify desde cero"
+        else
+            ok "Spotify no fue actualizado recientemente"
+        fi
+    else
+        info "No se pudo calcular la fecha — aplicando Spicetify de forma segura"
+        SPOTIFY_ACTUALIZADO=true
+    fi
+else
+    info "Log de pacman no encontrado — aplicando Spicetify de forma segura"
+    SPOTIFY_ACTUALIZADO=true
+fi
+
+# ================================================================
+# PASO 6: Aplicar Spicetify a Spotify
+# ================================================================
+titulo "PASO 6 — Aplicando Spicetify a Spotify"
+
+if [[ "$SPOTIFY_ACTUALIZADO" == true ]]; then
+    # Si Spotify fue actualizado, primero hacemos un nuevo backup interno
+    # (Spicetify necesita esto para saber qué archivos de Spotify modificar)
+    info "Haciendo backup interno de Spicetify..."
+    spicetify backup
+    ok "Backup interno completado"
+fi
+
+# Aplicamos el tema y extensiones configurados
+info "Aplicando configuración actual..."
+spicetify apply
+ok "Spicetify aplicado correctamente a Spotify"
+ACTUALIZACIONES+=("Configuración aplicada a Spotify")
+
+# ================================================================
+# FINALIZADO — Todo salió bien
+# ================================================================
+trap - ERR
+
+mostrar_resumen
+
+echo -e "${VERDE}${NEGRITA}¡Todo listo! Puedes abrir Spotify normalmente.${NC}"
+echo ""

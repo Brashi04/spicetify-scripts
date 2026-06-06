@@ -1,0 +1,75 @@
+#!/bin/bash
+
+LOG="/tmp/spicetify-update-check.log"
+exec > "$LOG" 2>&1
+
+notify() {
+  local title="$1" body="$2" urgency="${3:-normal}"
+  DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" \
+    omarchy-notification-send --urgency="$urgency" "$title" "$body"
+}
+
+echo "[$(date '+%F %T')] Iniciando comprobación de Spicetify..."
+
+# Esperar conectividad (hasta 30s)
+for i in $(seq 1 6); do
+  if curl -sf --max-time 5 https://api.github.com >/dev/null 2>&1; then
+    break
+  fi
+  echo "Esperando red... intento $i/6"
+  sleep 5
+done
+
+# Versión actual
+CURRENT=$(spicetify -v 2>/dev/null | tr -d '[:space:]')
+if [[ -z "$CURRENT" ]]; then
+  echo "ERROR: spicetify no encontrado"
+  notify "Spicetify" "Error: spicetify no encontrado en el sistema" critical
+  exit 1
+fi
+echo "Versión instalada: $CURRENT"
+
+# Versión más reciente en GitHub
+LATEST=$(curl -sf --max-time 10 \
+  "https://api.github.com/repos/spicetify/spicetify-cli/releases/latest" \
+  | grep '"tag_name"' \
+  | sed 's/.*"v\([^"]*\)".*/\1/')
+
+if [[ -z "$LATEST" ]]; then
+  echo "No se pudo obtener la última versión; saltando actualización"
+else
+  echo "Última versión disponible: $LATEST"
+  if [[ "$CURRENT" != "$LATEST" ]]; then
+    echo "Actualizando $CURRENT → $LATEST..."
+    yay -S --noconfirm --noprogressbar spicetify-cli
+    CURRENT=$(spicetify -v 2>/dev/null | tr -d '[:space:]')
+    echo "Versión tras actualización: $CURRENT"
+    notify "Spicetify actualizado" "v$CURRENT instalada correctamente"
+  else
+    echo "Spicetify ya está en la última versión ($CURRENT)"
+  fi
+fi
+
+# Verificar que los parches están aplicados
+echo "Aplicando parches Spicetify..."
+spicetify apply
+APPLY_EXIT=$?
+
+if (( APPLY_EXIT == 0 )); then
+  echo "OK: spicetify apply completado sin errores"
+  exit 0
+fi
+
+echo "WARN: spicetify apply falló (código $APPLY_EXIT); intentando backup apply..."
+spicetify backup apply
+BACKUP_EXIT=$?
+
+if (( BACKUP_EXIT == 0 )); then
+  echo "OK: backup apply completado"
+  notify "Spicetify" "Parches reaplicados desde backup (v$CURRENT)"
+  exit 0
+fi
+
+echo "ERROR: backup apply también falló (código $BACKUP_EXIT)"
+notify "Spicetify – Error" "No se pudieron aplicar los parches. Revisa el log: $LOG" critical
+exit 1
